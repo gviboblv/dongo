@@ -1,5 +1,5 @@
 package main
-#otak
+///otak
 import (
 	"fmt"
 	"log"

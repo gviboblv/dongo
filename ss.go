@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -17,19 +18,21 @@ import (
 )
 
 const (
-	iface        = "eth0"      
-	srcIP        = "127.0.0.1" 
-	dstIP        = "127.0.0.1" 
-	numWorkers   = 20          
-	totalPackets = 100000      
-	batchSize    = 100         
+	iface        = "eth0"
+	srcIP        = "127.0.0.1"
+	dstIP        = "127.0.0.1"
+	numWorkers   = 64          // Increased for EPYC 9754
+	totalPackets = 1000000     // Increased for stress testing
+	batchSize    = 500         // Larger batch size
+	bufferSize   = 2048        // Buffered channel size
 )
 
 var (
-	packetData  []byte
-	packetsSent uint64
-	shouldStop  atomic.Bool // Untuk mengontrol goroutine
-	wg         sync.WaitGroup
+	packetData    []byte
+	packetsSent   uint64
+	packetsQueued uint64
+	shouldStop    atomic.Bool
+	wg            sync.WaitGroup
 )
 
 func buildPacket() []byte {
@@ -59,9 +62,10 @@ func buildPacket() []byte {
 	return buf.Bytes()
 }
 
-func worker(id int, handle *pcap.Handle, jobs <-chan int) {
+func worker(id int, handle *pcap.Handle, jobs <-chan struct{}) {
 	defer wg.Done()
 	
+	// Pre-allocate batch buffer for this worker
 	localBatch := make([]byte, len(packetData)*batchSize)
 	for i := 0; i < batchSize; i++ {
 		copy(localBatch[i*len(packetData):], packetData)
@@ -71,11 +75,17 @@ func worker(id int, handle *pcap.Handle, jobs <-chan int) {
 		if shouldStop.Load() {
 			return
 		}
+		
+		// Send entire batch
 		for i := 0; i < batchSize; i++ {
 			if shouldStop.Load() {
 				return
 			}
-			err := handle.WritePacketData(localBatch[i*len(packetData) : (i+1)*len(packetData)])
+			
+			start := i * len(packetData)
+			end := (i + 1) * len(packetData)
+			
+			err := handle.WritePacketData(localBatch[start:end])
 			if err != nil {
 				continue
 			}
@@ -84,44 +94,27 @@ func worker(id int, handle *pcap.Handle, jobs <-chan int) {
 	}
 }
 
-func cleanup(handle *pcap.Handle) {
-	shouldStop.Store(true)
-	wg.Wait()
-	handle.Close()
-	fmt.Printf("\r\033[K") // Membersihkan baris saat ini
-	os.Exit(0)
-}
-
-func main() {
-	// Setup signal handling
+func setupSignalHandling(handle *pcap.Handle) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	fmt.Println("🚀 Kirim spoofed UDP packet...")
-
-	handle, err := pcap.OpenLive(iface, 65536, false, pcap.BlockForever)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Goroutine untuk menangani signal
+	
 	go func() {
 		<-sigChan
 		cleanup(handle)
 	}()
+}
 
-	packetData = buildPacket()
-	numBatches := totalPackets / batchSize
-	jobs := make(chan int, numBatches)
+func cleanup(handle *pcap.Handle) {
+	shouldStop.Store(true)
+	wg.Wait()
+	handle.Close()
+	fmt.Printf("\r\033[K")
+	os.Exit(0)
+}
 
-	// Start workers
-	for w := 1; w <= numWorkers; w++ {
-		wg.Add(1)
-		go worker(w, handle, jobs)
-	}
-
-	// Monitoring goroutine
+func startMonitoring() chan bool {
 	stopMonitor := make(chan bool)
+	
 	go func() {
 		lastCount := uint64(0)
 		ticker := time.NewTicker(time.Second)
@@ -134,25 +127,61 @@ func main() {
 					return
 				}
 				currentCount := atomic.LoadUint64(&packetsSent)
+				queuedCount := atomic.LoadUint64(&packetsQueued)
 				pps := currentCount - lastCount
-				fmt.Printf("\r⚡ Current PPS: %d | Total: %d", pps, currentCount)
+				
+				fmt.Printf("\rcurrent pps: %d | total sent: %d | queued: %d", 
+					pps, currentCount, queuedCount)
 				lastCount = currentCount
 			case <-stopMonitor:
 				return
 			}
 		}
 	}()
-
-	start := time.Now()
 	
-	// Send jobs
-	for j := 0; j < numBatches; j++ {
-		if shouldStop.Load() {
-			break
-		}
-		jobs <- j
+	return stopMonitor
+}
+
+func main() {
+	// Optimize for multi-core performance
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	
+	fmt.Printf("starting udp packet sender\n")
+	fmt.Printf("using %d cpu cores\n", runtime.NumCPU())
+	fmt.Printf("target packets: %d\n", totalPackets)
+	fmt.Printf("workers: %d\n", numWorkers)
+
+	handle, err := pcap.OpenLive(iface, 65536, false, pcap.BlockForever)
+	if err != nil {
+		log.Fatal(err)
 	}
-	close(jobs)
+
+	setupSignalHandling(handle)
+	
+	packetData = buildPacket()
+	numBatches := totalPackets / batchSize
+	jobs := make(chan struct{}, bufferSize)
+
+	// Start worker pool
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go worker(w, handle, jobs)
+	}
+
+	stopMonitor := startMonitoring()
+	start := time.Now()
+
+	// Queue jobs
+	go func() {
+		for j := 0; j < numBatches; j++ {
+			if shouldStop.Load() {
+				break
+			}
+			jobs <- struct{}{}
+			atomic.AddUint64(&packetsQueued, batchSize)
+		}
+		close(jobs)
+	}()
 
 	wg.Wait()
 	close(stopMonitor)
@@ -160,8 +189,11 @@ func main() {
 	if !shouldStop.Load() {
 		duration := time.Since(start)
 		finalCount := atomic.LoadUint64(&packetsSent)
-		fmt.Printf("\n✅ Sukses kirim %d packet dalam %v\n", finalCount, duration)
-		fmt.Printf("⚡ Average PPS: %.2f\n", float64(finalCount)/duration.Seconds())
+		avgPPS := float64(finalCount) / duration.Seconds()
+		
+		fmt.Printf("\ncompleted: %d packets in %v\n", finalCount, duration)
+		fmt.Printf("average pps: %.2f\n", avgPPS)
+		fmt.Printf("peak throughput: %.2f mbps\n", (avgPPS*float64(len(packetData))*8)/1_000_000)
 	}
 
 	cleanup(handle)

@@ -17,13 +17,16 @@ func main() {
 
 	fmt.Println("🚀 Amplifier aktif di UDP port 123")
 	buffer := make([]byte, 512)
+	
+	// Pre-alokasi response buffer sekali saja
+	response := make([]byte, RESPONSE_SIZE)
+	for i := range response {
+		response[i] = 0x1c
+	}
 
 	for {
 		_, remoteAddr, _ := conn.ReadFromUDP(buffer)
-		response := make([]byte, RESPONSE_SIZE)
-		for i := range response {
-			response[i] = 0x1c
-		}
+		// Gunakan response yang sudah dialokasi
 		conn.WriteToUDP(response, remoteAddr)
 	}
 }

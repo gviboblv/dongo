@@ -10,7 +10,7 @@ import (
 const (
 	PORT          = ":123"
 	RESPONSE_SIZE = 1024 * 4 // 4 KB payload
-	NUM_WORKERS   = 32       // Sesuaikan dengan core count EPYC 9754
+	NUM_WORKERS   = 8       // Sesuaikan dengan core count EPYC 9754
 )
 
 func main() {

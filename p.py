@@ -1,7 +1,7 @@
 # p.py
 import asyncio
 
-RESPONSE_SIZE = 4096
+RESPONSE_SIZE = 1250000
 NTP_PORT = 123
 
 class NTPAmplifier(asyncio.DatagramProtocol):
